@@ -22,7 +22,8 @@ type ContextKey string
 const UserIDKey ContextKey = "userId"
 
 const (
-	QuicListenAddr = ":4433"
+	// QuicListenAddr = ":4433"
+	QuicListenAddr = ":7000"
 	QuicProto      = "quic-api"
 	HttpListenAddr = ":7000"
 )
