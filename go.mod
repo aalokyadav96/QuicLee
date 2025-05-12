@@ -2,7 +2,13 @@ module naevis
 
 go 1.24.0
 
-require github.com/quic-go/quic-go v0.50.0
+require (
+	github.com/joho/godotenv v1.5.1
+	github.com/julienschmidt/httprouter v1.3.0
+	github.com/quic-go/quic-go v0.50.0
+	github.com/rs/cors v1.11.1
+	golang.org/x/time v0.5.0
+)
 
 require (
 	github.com/go-task/slim-sprig v0.0.0-20230315185526-52ccab3ef572 // indirect

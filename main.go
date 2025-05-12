@@ -3,145 +3,157 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"encoding/binary"
-	"io"
+	"fmt"
 	"log"
+	"naevis/globals"
+	"naevis/ratelim"
+	"naevis/routes"
 	"net/http"
-	"sync"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
+	"github.com/joho/godotenv"
+	"github.com/julienschmidt/httprouter"
 	quic "github.com/quic-go/quic-go"
+	"github.com/rs/cors"
 )
 
-const (
-	// Where the worker will connect
-	quicListenAddr = ":4433"
-	// The ALPN proto for QUIC
-	quicProto = "quic-api"
-)
+// Middleware: Security headers
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Cache-Control", "max-age=0, no-cache, no-store, must-revalidate, private")
+		next.ServeHTTP(w, r)
+	})
+}
 
-var (
-	activeConn quic.Connection
-	connMu     sync.RWMutex
-)
+// Middleware: Simple request logging
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("[%s] %s %s", r.Method, r.RequestURI, r.RemoteAddr)
+		next.ServeHTTP(w, r)
+	})
+}
 
-// acceptClients runs in the background and populates `activeConn`.
-func acceptClients() {
+// Health check endpoint
+func Index(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	fmt.Fprint(w, "200")
+}
+
+func acceptClients(ctx context.Context) {
 	cert, err := tls.LoadX509KeyPair("cert.pem", "key.pem")
 	if err != nil {
-		log.Fatal("tls cert load:", err)
+		log.Fatalf("[GATEWAY] tls cert load: %v", err)
 	}
-	listener, err := quic.ListenAddr(quicListenAddr, &tls.Config{
+	listener, err := quic.ListenAddr(globals.QuicListenAddr, &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{quicProto},
+		NextProtos:   []string{globals.QuicProto},
 	}, nil)
 	if err != nil {
-		log.Fatal("quic listen:", err)
+		log.Fatalf("[GATEWAY] quic listen: %v", err)
 	}
-	log.Println("gateway: QUIC listening on", quicListenAddr)
+	log.Printf("[GATEWAY] QUIC listening on %s", globals.QuicListenAddr)
+
+	go func() {
+		<-ctx.Done()
+		log.Println("[GATEWAY] Shutting down QUIC listener...")
+		listener.Close()
+	}()
 
 	for {
 		sess, err := listener.Accept(context.Background())
 		if err != nil {
-			log.Println("gateway: accept error:", err)
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				log.Printf("[GATEWAY] accept error: %v", err)
+			}
 			continue
 		}
-		connMu.Lock()
-		if activeConn != nil {
-			activeConn.CloseWithError(0, "new client connected")
+		globals.ConnMu.Lock()
+		if globals.ActiveConn != nil {
+			globals.ActiveConn.CloseWithError(0, "new client connected")
 		}
-		activeConn = sess
-		connMu.Unlock()
-		log.Println("gateway: client connected:", sess.RemoteAddr())
+		globals.ActiveConn = sess
+		globals.ConnMu.Unlock()
+		log.Printf("[GATEWAY] client connected: %s", sess.RemoteAddr())
 	}
 }
 
-// writeFrame writes a 2-byte length prefix and then the payload.
-func writeFrame(w io.Writer, data []byte) error {
-	if len(data) > 0xFFFF {
-		return io.ErrShortBuffer
-	}
-	var lb [2]byte
-	binary.BigEndian.PutUint16(lb[:], uint16(len(data)))
-	if _, err := w.Write(lb[:]); err != nil {
-		return err
-	}
-	_, err := w.Write(data)
-	return err
-}
+// Set up all routes and middleware layers
+func setupRouter(rateLimiter *ratelim.RateLimiter) http.Handler {
+	router := httprouter.New()
+	router.GET("/health", Index)
 
-// readFrame reads back a 2-byte length prefix and then the payload.
-func readFrame(r io.Reader) ([]byte, error) {
-	var lb [2]byte
-	if _, err := io.ReadFull(r, lb[:]); err != nil {
-		return nil, err
-	}
-	n := binary.BigEndian.Uint16(lb[:])
-	buf := make([]byte, n)
-	_, err := io.ReadFull(r, buf)
-	return buf, err
-}
+	routes.AddProxyRoutes(router, rateLimiter)
 
-func apiHandler(w http.ResponseWriter, r *http.Request) {
-	// Grab the active client connection
-	connMu.RLock()
-	sess := activeConn
-	connMu.RUnlock()
-	if sess == nil || sess.Context().Err() != nil {
-		http.Error(w, "no backend client connected", http.StatusServiceUnavailable)
-		return
-	}
+	c := cors.New(cors.Options{
+		AllowedOrigins:   []string{"*"}, // Restrict in production
+		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"Content-Type", "Authorization"},
+		AllowCredentials: true,
+	})
 
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-
-	stream, err := sess.OpenStreamSync(ctx)
-	if err != nil {
-		http.Error(w, "failed to open QUIC stream: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-	defer stream.Close()
-
-	// 1) method
-	if err := writeFrame(stream, []byte(r.Method)); err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-	// 2) path
-	if err := writeFrame(stream, []byte(r.URL.Path)); err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-	// 3) body (raw JSON, if any)
-	if r.Body != nil {
-		if _, err := io.Copy(stream, r.Body); err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-	}
-	// half-close the write side to signal end-of-frame
-	if err := stream.Close(); err != nil {
-		log.Println("gateway warning: close write:", err)
-	}
-
-	// Read back a single JSON payload frame
-	respBytes, err := io.ReadAll(stream)
-	if err != nil {
-		http.Error(w, "reading backend reply: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-
-	// Proxy it back
-	w.Header().Set("Content-Type", "application/json")
-	w.Write(respBytes)
+	return loggingMiddleware(securityHeaders(c.Handler(router)))
 }
 
 func main() {
-	// Start QUIC acceptor
-	go acceptClients()
+	// Load .env
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found. Continuing with system environment variables.")
+	}
 
-	// Start HTTP API
-	http.HandleFunc("/api", apiHandler)
-	log.Println("gateway: HTTP listening on :4000")
-	log.Fatal(http.ListenAndServe(":4000", nil))
+	// Setup graceful shutdown context
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// Start QUIC listener in a goroutine
+	go acceptClients(ctx)
+
+	// Set up rate limiter and HTTP server
+	rateLimiter := ratelim.NewRateLimiter()
+	handler := setupRouter(rateLimiter)
+
+	server := &http.Server{
+		Addr:              globals.HttpListenAddr,
+		Handler:           handler,
+		ReadTimeout:       7 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		ReadHeaderTimeout: 2 * time.Second,
+	}
+
+	// Register shutdown logic
+	server.RegisterOnShutdown(func() {
+		log.Println("🛑 Cleaning up resources before shutdown...")
+		// Add any DB or connection cleanup here
+	})
+
+	// Start HTTP server
+	go func() {
+		log.Printf("🚀 HTTP server listening on %s", globals.HttpListenAddr)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("❌ HTTP server error: %v", err)
+		}
+	}()
+
+	// Wait for shutdown signal
+	<-ctx.Done()
+	stop() // release signal notify resources
+
+	log.Println("🛑 Shutdown signal received. Shutting down gracefully...")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Fatalf("❌ Server shutdown failed: %v", err)
+	}
+
+	log.Println("✅ Server stopped cleanly")
 }
